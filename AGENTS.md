@@ -90,6 +90,66 @@ When the repo/image passes inspection, return:
 
 If the script cannot inspect the target (e.g., image pull fails, missing tools), return `affected: false` with an explanatory summary rather than exiting non-zero. The worker treats non-zero exit codes and invalid JSON as scan failures.
 
+## Writing `implementation_spec` Text
+
+The `implementation_spec` is not just a comment on the finding — it becomes
+the primary task description for the AI agent (Chai Bot) that implements the
+fix, so how it is written directly determines whether the agent produces a
+correct change. A real failure (SRVKS-1371 / openshift-knative/serving#1797)
+is instructive: a spec that said "Change the Dockerfile/Containerfile FROM
+instruction to registry.access.redhat.com/ubi10/micro" led the agent to edit
+the FROM ARG in 29 Dockerfiles that were all marked `# DO NOT EDIT!
+Generated Dockerfile`. The correct fix required changing Dockerfile
+**templates** in a different repository, updating the Konflux
+`imageOverrides` in that repository's build config, and reworking a template
+that used `microdnf install`. The spec was prescriptive when it should have
+been outcome-oriented.
+
+### Outcome-oriented, not prescriptive
+
+Describe the desired end state, not which specific file to edit. The solve
+agent has access to the full source repository and can determine the correct
+implementation path — the spec should tell it *what* to achieve, not *how*.
+
+- Bad: "Change the Dockerfile FROM instruction to ubi10/micro."
+- Good: "This image must use ubi10/micro as its runtime base. Determine
+  where the base image reference is controlled before making changes."
+
+### Acknowledge detection-level limitations
+
+Image scripts (`scanner_type=image`) can only see OCI metadata — they don't
+know whether Dockerfiles are hand-written or generated, whether the build
+pipeline overrides values, or whether the source of truth is in a different
+repository. The spec should explicitly note what the detection could and
+could not see, so the agent knows to investigate further instead of assuming
+that the first matching file is the thing to edit.
+
+### Warn about common repo patterns
+
+When writing a spec for a Dockerfile/image change, mention that the agent
+should check for:
+
+- **Generated files** — "DO NOT EDIT" markers, generator scripts such as
+  `generate.sh`, Makefile targets that regenerate Dockerfiles
+- **Build pipeline overrides** — Konflux `imageOverrides`, ci-operator
+  configs, Tekton pipeline configs, Makefile ARG overrides
+- **Cross-repo dependencies** — shared template repositories, external build
+  configs owned by another team
+
+### Keep it concise
+
+The spec is injected into the agent's prompt alongside other instructions,
+which have limited context. Long, overly detailed specs dilute the agent's
+attention — focus on the goal, constraints, and investigation hints, not
+step-by-step procedures.
+
+### Include escape hatches
+
+If the change might not be feasible for some repositories (e.g. heavy RPM
+dependencies make a micro base infeasible), include guidance on how to close
+the tracker with a justification instead of forcing a change that would
+break the build or the operator.
+
 ## Environment
 
 Scripts run inside the SCI worker container (Node.js 22 Alpine-based). Available tools:
