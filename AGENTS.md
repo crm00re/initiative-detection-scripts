@@ -164,6 +164,21 @@ Scripts have a **5-minute timeout**. If the script hasn't exited by then, it's k
 
 Name scripts descriptively: `detect-<what-you-are-looking-for>.sh`
 
+## Testing a Script
+
+Every script gets a fixture test next to it: `tests/detect-<name>.test.sh`.
+Fixture tests build small throwaway repos/images in a temp dir, run the script,
+and assert the JSON contract with `jq`. Run them all with:
+
+```bash
+for t in tests/*.test.sh; do bash "$t" || exit 1; done
+```
+
+Because a dry run is reviewed by a human and then re-run, assert three things
+beyond the happy path: hit `file` values are **repo-relative**, two runs of the
+same tree produce **identical** output, and a file that merely *mentions* a
+migration keyword does not change the verdict.
+
 ## Example: Image Scan Script
 
 See `detect-non-ubi-minimal.sh` — inspects Red Hat container images to check whether they are built on an approved minimal base image (ubi9-minimal, ubi-micro, etc.). Demonstrates:

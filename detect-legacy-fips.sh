@@ -25,6 +25,26 @@ set -euo pipefail
 REPO_DIR="${1:-.}"
 cd "$REPO_DIR" || exit 1
 
+# Stable byte order so two dry runs of the same commit produce identical JSON.
+export LC_ALL=C
+
+# Build files where FIPS settings live. Shared by the "already migrated" probe
+# and the individual indicators so the two cannot disagree about what counts.
+BUILD_INCLUDES=(
+  --include='Dockerfile*' --include='Containerfile*' --include='*.containerfile'
+  --include='Makefile*' --include='makefile' --include='GNUmakefile' --include='*.mk'
+  --include='*.sh' --include='*.env' --include='*.yaml' --include='*.yml'
+)
+CONTAINER_INCLUDES=(
+  --include='Dockerfile*' --include='Containerfile*' --include='*.containerfile'
+)
+SCRIPT_INCLUDES=(
+  "${CONTAINER_INCLUDES[@]}"
+  --include='Makefile*' --include='makefile' --include='GNUmakefile' --include='*.mk'
+  --include='*.sh'
+)
+EXCLUDES=(--exclude-dir=.git)
+
 # â”€â”€ helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 debug() { echo "[DEBUG] $*" >&2; }
 
@@ -32,6 +52,11 @@ HITS_JSON="[]"
 
 add_hit() {
   local file="$1" line="$2" match="$3" description="$4" suggestion="$5"
+  # AGENTS.md requires repo-relative hit paths. grep runs on '.' after the cd
+  # above, so it reports './Dockerfile'; strip that prefix. Filenames are also
+  # parsed with IFS=: (see the callers), so a file whose name contains ':' would
+  # shift fields -- pre-existing, and acceptable for source trees.
+  file="${file#./}"
   HITS_JSON=$(echo "$HITS_JSON" | jq \
     --arg file      "$file" \
     --arg line      "$line" \
@@ -49,12 +74,20 @@ add_hit() {
 
 # â”€â”€ early exit: check if already migrated â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 #
-# If the repo already sets GOFIPS140 anywhere, or uses -tags no_openssl,
-# consider it migrated.
+# Only a GOFIPS140 setting in *build* configuration means the repo is migrated.
+# Scanning every file for the string meant a repo that merely documented the
+# migration (README, issue template, vendored notes) was reported clean even
+# when its Dockerfile still set GOEXPERIMENT=boringcrypto.
 
-if grep -rqE 'GOFIPS140\s*[:=]' "$REPO_DIR" 2>/dev/null; then
-  debug "Repo already sets GOFIPS140 â€” not affected."
-  jq -n '{affected: false, summary: "Repository already uses GOFIPS140 (golang-native FIPS). No migration needed."}'
+if grep -rqE 'GOFIPS140[[:space:]]*[:=]' "${BUILD_INCLUDES[@]}" "${EXCLUDES[@]}" . 2>/dev/null; then
+  debug "Build configuration already sets GOFIPS140 - not affected."
+  jq -n '{
+    affected: false,
+    severity: "info",
+    summary: "Repository build configuration already sets GOFIPS140 (golang-native FIPS). No migration needed.",
+    hits: [],
+    implementation_spec: ""
+  }'
   exit 0
 fi
 
@@ -64,10 +97,8 @@ while IFS=: read -r file lineno match; do
   add_hit "$file" "$lineno" "$match" \
     "Sets GOEXPERIMENT=boringcrypto, which links against OpenSSL for FIPS." \
     "Remove GOEXPERIMENT=boringcrypto and set GOFIPS140=v1.26.0 instead. Add CGO_ENABLED=0 if no other cgo dependencies exist."
-done < <(grep -rnE 'GOEXPERIMENT\s*[:=]\s*['\''"]?boringcrypto' \
-  --include='Dockerfile*' --include='Makefile*' --include='*.mk' \
-  --include='*.sh' --include='*.env' \
-  "$REPO_DIR" 2>/dev/null || true)
+done < <(grep -rnE 'GOEXPERIMENT[[:space:]]*[:=][[:space:]]*['\''"]?boringcrypto' \
+  "${BUILD_INCLUDES[@]}" "${EXCLUDES[@]}" . 2>/dev/null || true)
 
 # â”€â”€ 2. GOFIPS=1 (legacy env var) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 debug "Scanning for GOFIPS=1â€¦"
@@ -80,10 +111,8 @@ while IFS=: read -r file lineno match; do
   add_hit "$file" "$lineno" "$match" \
     "Sets legacy GOFIPS=1 without GOFIPS140. This uses the old OpenSSL-backed path." \
     "Replace GOFIPS=1 with GOFIPS140=v1.26.0."
-done < <(grep -rnE '(^|[[:space:]])GOFIPS\s*[:=]\s*1' \
-  --include='Dockerfile*' --include='Makefile*' --include='*.mk' \
-  --include='*.sh' --include='*.env' \
-  "$REPO_DIR" 2>/dev/null || true)
+done < <(grep -rnE '(^|[[:space:]])GOFIPS[[:space:]]*[:=][[:space:]]*1' \
+  "${BUILD_INCLUDES[@]}" "${EXCLUDES[@]}" . 2>/dev/null || true)
 
 # â”€â”€ 3. import "crypto/tls/fipsonly" â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 debug "Scanning for crypto/tls/fipsonly importsâ€¦"
@@ -92,8 +121,7 @@ while IFS=: read -r file lineno match; do
     "Imports the deprecated crypto/tls/fipsonly package." \
     "Remove the crypto/tls/fipsonly import. When built with GOFIPS140, FIPS-approved TLS configuration is enforced automatically."
 done < <(grep -rnE '"crypto/tls/fipsonly"' \
-  --include='*.go' \
-  "$REPO_DIR" 2>/dev/null || true)
+  --include='*.go' "${EXCLUDES[@]}" . 2>/dev/null || true)
 
 # â”€â”€ 4. Build tags referencing "openssl" â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 debug "Scanning for openssl build tagsâ€¦"
@@ -106,10 +134,8 @@ while IFS=: read -r file lineno match; do
   add_hit "$file" "$lineno" "$match" \
     "Uses an 'openssl' build tag, which links the binary against OpenSSL." \
     "Replace the openssl build tag with '-tags no_openssl' and set GOFIPS140=v1.26.0."
-done < <(grep -rnE -- '-tags\s+\S*openssl' \
-  --include='Dockerfile*' --include='Makefile*' --include='*.mk' \
-  --include='*.sh' \
-  "$REPO_DIR" 2>/dev/null || true)
+done < <(grep -rnE -- '-tags[[:space:]]+[^[:space:]]*openssl' \
+  "${SCRIPT_INCLUDES[@]}" "${EXCLUDES[@]}" . 2>/dev/null || true)
 
 # â”€â”€ 5. GOLANG_FIPS=1 in Dockerfiles â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 debug "Scanning for GOLANG_FIPS=1â€¦"
@@ -117,18 +143,21 @@ while IFS=: read -r file lineno match; do
   add_hit "$file" "$lineno" "$match" \
     "Sets GOLANG_FIPS=1 at build time. This is a runtime toggle that should not be set during builds." \
     "Remove GOLANG_FIPS=1 and use GOFIPS140=v1.26.0 to enable golang-native FIPS at build time."
-done < <(grep -rnE 'GOLANG_FIPS\s*[:=]\s*1' \
-  --include='Dockerfile*' \
-  "$REPO_DIR" 2>/dev/null || true)
+done < <(grep -rnE 'GOLANG_FIPS[[:space:]]*[:=][[:space:]]*1' \
+  "${CONTAINER_INCLUDES[@]}" "${EXCLUDES[@]}" . 2>/dev/null || true)
 
 # â”€â”€ emit results â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-HIT_COUNT=$(echo "$HITS_JSON" | jq 'length')
+HITS_JSON=$(printf '%s' "$HITS_JSON" | jq 'sort_by(.file, .line, .match)')
+HIT_COUNT=$(printf '%s' "$HITS_JSON" | jq 'length')
 debug "Found $HIT_COUNT legacy FIPS indicator(s)."
 
 if [ "$HIT_COUNT" -eq 0 ]; then
   jq -n '{
     affected: false,
-    summary: "No legacy FIPS crypto indicators found. Repository either has no FIPS settings or is already using a non-OpenSSL approach."
+    severity: "info",
+    summary: "No legacy FIPS crypto indicators found. Repository either has no FIPS settings or is already using a non-OpenSSL approach.",
+    hits: [],
+    implementation_spec: ""
   }'
 else
   jq -n \
