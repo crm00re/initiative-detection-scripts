@@ -54,7 +54,10 @@ out="$(run "${legacy}")"
 check "legacy repo is affected" "true" "$(jq -r '.affected' <<<"${out}")"
 check "legacy repo reports 5 hits" "5" "$(jq -r '.hits | length' <<<"${out}")"
 check "hit paths are repo-relative" "0" \
-  "$(jq -r '[.hits[].file] | map(select(startswith("/"))) | length' <<<"${out}")"
+  "$(jq -r '[.hits[].file] | map(select(startswith("/") or startswith("./"))) | length' <<<"${out}")"
+check "hit paths match the fixture exactly" \
+  "Dockerfile:2 Dockerfile:3 Dockerfile:4 Makefile:2 cmd/app/main.go:4" \
+  "$(jq -r '[.hits[] | "\(.file):\(.line)"] | join(" ")' <<<"${out}")"
 check "hit paths are sorted" "true" \
   "$(jq -r '[.hits[].file] as $f | ($f == ($f | sort))' <<<"${out}")"
 check "hit line numbers are integers" "true" \
@@ -65,6 +68,22 @@ check "affected result carries an implementation_spec" "true" \
 # ── determinism: the dry-run can be repeated and diffed ──────────────────────
 check "two runs of the same tree are byte-identical" "same" \
   "$([ "$(run "${legacy}")" = "$(run "${legacy}")" ] && echo same || echo different)"
+
+# ── line numbers sort numerically, not lexicographically ─────────────────────
+ordering="${WORK}/ordering"
+mkdir -p "${ordering}"
+{ for n in $(seq 1 12); do
+    if [ "${n}" -eq 2 ] || [ "${n}" -eq 10 ]; then
+      echo "ENV GOLANG_FIPS=1"
+    else
+      echo "# filler ${n}"
+    fi
+  done; } > "${ordering}/Dockerfile"
+out="$(run "${ordering}")"
+check "line 2 sorts before line 10" "10" \
+  "$(jq -r '.hits | map(.line) | last' <<<"${out}")"
+check "line numbers stay numeric in JSON" "true" \
+  "$(jq -r '[.hits[].line] | all(type == "number")' <<<"${out}")"
 
 # ── regression: documentation mentioning GOFIPS140 is not a migration ────────
 docs="${WORK}/docs-mention"
@@ -100,6 +119,15 @@ out="$(run "${clean}")"
 check "clean repo is not affected" "false" "$(jq -r '.affected' <<<"${out}")"
 check "clean result is contract-complete" "true" \
   "$(jq -r 'has("severity") and has("hits") and has("implementation_spec")' <<<"${out}")"
+
+# ── .git is not traversed ────────────────────────────────────────────────────
+withgit="${WORK}/with-git"
+mkdir -p "${withgit}"
+printf 'FROM scratch\n' > "${withgit}/Dockerfile"
+git -C "${withgit}" init -q .
+printf 'ENV GOLANG_FIPS=1\n' > "${withgit}/.git/Dockerfile"
+out="$(run "${withgit}")"
+check ".git contents are not scanned" "false" "$(jq -r '.affected' <<<"${out}")"
 
 # ── Containerfile-only repo: include globs must cover it ─────────────────────
 containerfile="${WORK}/containerfile"

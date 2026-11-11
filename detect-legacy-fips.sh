@@ -35,8 +35,11 @@ BUILD_INCLUDES=(
   --include='Makefile*' --include='makefile' --include='GNUmakefile' --include='*.mk'
   --include='*.sh' --include='*.env' --include='*.yaml' --include='*.yml'
 )
-SCRIPT_INCLUDES=(
+CONTAINER_INCLUDES=(
   --include='Dockerfile*' --include='Containerfile*' --include='*.containerfile'
+)
+SCRIPT_INCLUDES=(
+  "${CONTAINER_INCLUDES[@]}"
   --include='Makefile*' --include='makefile' --include='GNUmakefile' --include='*.mk'
   --include='*.sh'
 )
@@ -49,8 +52,10 @@ HITS_JSON="[]"
 
 add_hit() {
   local file="$1" line="$2" match="$3" description="$4" suggestion="$5"
-  # AGENTS.md requires repo-relative hit paths; "$REPO_DIR" is absolute in the
-  # worker, and grep reports it verbatim unless we strip the prefix here.
+  # AGENTS.md requires repo-relative hit paths. grep runs on '.' after the cd
+  # above, so it reports './Dockerfile'; strip that prefix. Filenames are also
+  # parsed with IFS=: (see the callers), so a file whose name contains ':' would
+  # shift fields -- pre-existing, and acceptable for source trees.
   file="${file#./}"
   HITS_JSON=$(echo "$HITS_JSON" | jq \
     --arg file      "$file" \
@@ -92,7 +97,7 @@ while IFS=: read -r file lineno match; do
   add_hit "$file" "$lineno" "$match" \
     "Sets GOEXPERIMENT=boringcrypto, which links against OpenSSL for FIPS." \
     "Remove GOEXPERIMENT=boringcrypto and set GOFIPS140=v1.26.0 instead. Add CGO_ENABLED=0 if no other cgo dependencies exist."
-done < <(grep -rnE 'GOEXPERIMENT\s*[:=]\s*['\''"]?boringcrypto' \
+done < <(grep -rnE 'GOEXPERIMENT[[:space:]]*[:=][[:space:]]*['\''"]?boringcrypto' \
   "${BUILD_INCLUDES[@]}" "${EXCLUDES[@]}" . 2>/dev/null || true)
 
 # â”€â”€ 2. GOFIPS=1 (legacy env var) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -106,7 +111,7 @@ while IFS=: read -r file lineno match; do
   add_hit "$file" "$lineno" "$match" \
     "Sets legacy GOFIPS=1 without GOFIPS140. This uses the old OpenSSL-backed path." \
     "Replace GOFIPS=1 with GOFIPS140=v1.26.0."
-done < <(grep -rnE '(^|[[:space:]])GOFIPS\s*[:=]\s*1' \
+done < <(grep -rnE '(^|[[:space:]])GOFIPS[[:space:]]*[:=][[:space:]]*1' \
   "${BUILD_INCLUDES[@]}" "${EXCLUDES[@]}" . 2>/dev/null || true)
 
 # â”€â”€ 3. import "crypto/tls/fipsonly" â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -129,7 +134,7 @@ while IFS=: read -r file lineno match; do
   add_hit "$file" "$lineno" "$match" \
     "Uses an 'openssl' build tag, which links the binary against OpenSSL." \
     "Replace the openssl build tag with '-tags no_openssl' and set GOFIPS140=v1.26.0."
-done < <(grep -rnE -- '-tags\s+\S*openssl' \
+done < <(grep -rnE -- '-tags[[:space:]]+[^[:space:]]*openssl' \
   "${SCRIPT_INCLUDES[@]}" "${EXCLUDES[@]}" . 2>/dev/null || true)
 
 # â”€â”€ 5. GOLANG_FIPS=1 in Dockerfiles â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -138,13 +143,12 @@ while IFS=: read -r file lineno match; do
   add_hit "$file" "$lineno" "$match" \
     "Sets GOLANG_FIPS=1 at build time. This is a runtime toggle that should not be set during builds." \
     "Remove GOLANG_FIPS=1 and use GOFIPS140=v1.26.0 to enable golang-native FIPS at build time."
-done < <(grep -rnE 'GOLANG_FIPS\s*[:=]\s*1' \
-  --include='Dockerfile*' --include='Containerfile*' --include='*.containerfile' \
-  "${EXCLUDES[@]}" . 2>/dev/null || true)
+done < <(grep -rnE 'GOLANG_FIPS[[:space:]]*[:=][[:space:]]*1' \
+  "${CONTAINER_INCLUDES[@]}" "${EXCLUDES[@]}" . 2>/dev/null || true)
 
 # â”€â”€ emit results â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 HITS_JSON=$(printf '%s' "$HITS_JSON" | jq 'sort_by(.file, .line, .match)')
-HIT_COUNT=$(echo "$HITS_JSON" | jq 'length')
+HIT_COUNT=$(printf '%s' "$HITS_JSON" | jq 'length')
 debug "Found $HIT_COUNT legacy FIPS indicator(s)."
 
 if [ "$HIT_COUNT" -eq 0 ]; then
