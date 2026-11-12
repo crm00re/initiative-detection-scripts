@@ -288,6 +288,29 @@ EOF
 check "Containerfile GOLANG_FIPS=1 is detected" "true" \
   "$(jq -r '.affected' <<<"$(run "${containerfile}")")"
 
+# ── the -tags forms that actually work in practice ─────────────────────────
+# `-tags openssl`, `-tags=openssl` and `-tags="openssl"` are all valid; an
+# earlier version only matched the first, so a repo using the equals form was
+# reported clean.
+for form in '-tags openssl' '-tags=openssl' '-tags="openssl"' '-tags "openssl"'; do
+  tdir="${WORK}/tags-$(printf '%s' "${form}" | tr -c 'a-zA-Z0-9' '_')"
+  mkdir -p "${tdir}"
+  mk_go "${tdir}"
+  printf 'FROM x\nRUN go build %s -o /a ./cmd\n' "${form}" > "${tdir}/Dockerfile"
+  check "openssl build tag detected in form: ${form}" "true" \
+    "$(jq -r '.affected' <<<"$(run "${tdir}")")"
+done
+
+# ── golang 1.27+ qualifies regardless of the build group ────────────────────
+# golang_builder_FIPS_wrapper.sh defaults GO_COMPLIANCE_BUILTIN_FIPS_INCLUDE to
+# '.*' from 1.27 on; only 1.26 needs an openshift-5.1+ group.
+g127="${WORK}/golang127-old-group"
+mkdir -p "${g127}"
+mk_go "${g127}"
+mk_buildroot "${g127}" rhel-9-release-golang-1.27-openshift-5.0
+check "golang 1.27 on a 5.0 build root is not affected" "false" \
+  "$(jq -r '.affected' <<<"$(run "${g127}")")"
+
 # ── no_openssl alone is not a hit ──────────────────────────────────────────
 noopenssl="${WORK}/no-openssl"
 mkdir -p "${noopenssl}"

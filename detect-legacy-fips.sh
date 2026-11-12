@@ -9,19 +9,29 @@
 # OpenSSL-backed FIPS crypto path instead of the golang-native FIPS
 # module (GOFIPS140, golang >= 1.26).
 #
-# PRIMARY SIGNAL: the ci-operator build root
-#   OCP Go builds take their toolchain from the build root image declared
-#   in .ci-operator.yaml, not from the repository's own Dockerfile:
+# PRIMARY SIGNAL: the ci-operator build root, as a proxy for the build group
+#   The toolchain a repository builds with, and the OCP release it targets,
+#   are declared in .ci-operator.yaml:
 #
 #     build_root_image:
 #       name: release
 #       namespace: openshift
 #       tag: rhel-9-release-golang-1.26-openshift-5.1
 #
-#   The `golang-X.Y` component is what decides native vs OpenSSL FIPS, and
-#   `openshift-X.Y` says which payload the repo currently targets. Grepping
-#   Dockerfiles for GOEXPERIMENT/GOFIPS misses this entirely, which is why
-#   it is checked first.
+#   That tag is a PROXY, not the authority. For production payload images the
+#   decision is made at build time by the ART/Doozer shim
+#   (openshift-eng/art-tools, doozer/doozerlib/golang_builder_FIPS_wrapper.sh),
+#   which sets GOFIPS140=v1.26.0 only when either
+#     - the toolchain is golang 1.27 or later, or
+#     - the toolchain is golang 1.26 and __doozer_group is openshift-5.1+.
+#   Everything else -- golang <= 1.25, or golang 1.26 on an older group --
+#   falls back to GOFIPS140=off and the OpenSSL backend. The build root tag
+#   correlates with both inputs of that decision (golang-X.Y, openshift-X.Y)
+#   and is the only one of them visible from inside the repository: Doozer
+#   reads the builder image from ocp-build-data, and __doozer_group is set by
+#   the build itself. Neither can be seen from a clone.
+#
+#   The build root image does NOT set GOFIPS140 itself; the shim does.
 #
 # SECONDARY SIGNAL: explicit build settings that override the toolchain
 #   GOEXPERIMENT=boringcrypto, GOFIPS=1, GOLANG_FIPS=1, `-tags openssl`,
@@ -32,6 +42,17 @@
 # NOT GO -> NOT IN SCOPE
 #   The initiative covers golang binaries. A repository that ships no Go
 #   source is not affected even if its build root is older.
+#
+# KNOWN BLIND SPOTS
+#   - Doozer can inject a per-component GOFIPS140=off from ocp-build-data.
+#     In openshift-5.1 that is exactly ose-haproxy-router-haproxy32,
+#     ose-vmware-vsphere-csi-driver and vmware-vsphere-syncer: their repos
+#     look migrated, but the payload build opts out. Not visible from a clone.
+#   - RPM builds use golang_builder_FIPS_wrapper_rpm.sh, a separate path that
+#     this build-root proxy says nothing about.
+#   - Konflux/Tekton builds do not go through the ART shim at all; each repo
+#     must set GOFIPS140=v1.26.0 itself (Dockerfile.konflux, tracked by
+#     CNF-27805). Those are routed to manual review.
 #
 # Emits the JSON contract documented in AGENTS.md. Always exits 0: the
 # worker treats a non-zero exit or invalid JSON as a scan failure and
@@ -190,7 +211,7 @@ while IFS=: read -r file lineno match; do
   add_hit "${file}" "${lineno}" "${match}" \
     "Uses an 'openssl' build tag, which links the binary against OpenSSL instead of the native FIPS module." \
     "Replace the openssl build tag with no_openssl and build with golang 1.26."
-done < <(grep -rnE -- '-tags[[:space:]]+[^[:space:]]*openssl' \
+done < <(grep -rnE -- '-tags([[:space:]]*=[[:space:]]*|[[:space:]]+)[^[:space:]]*openssl' \
   "${SCRIPT_INCLUDES[@]}" "${EXCLUDES[@]}" . 2>/dev/null || true)
 
 while IFS=: read -r file lineno match; do
@@ -221,7 +242,7 @@ if [ -n "${EXPLICIT_NATIVE_VER}" ]; then
   fi
 fi
 
-# ── 2. authoritative toolchain signal: the ci-operator build root ────────────
+# ── 2. primary proxy signal: the ci-operator build root ──────────────────────
 BR_LINE=""
 BR_TAG=""
 BR_RAW="$(ci_operator_build_root)"
@@ -239,7 +260,7 @@ SPEC=""
 if [ -n "${GOLANG_VER}" ] && ver_ge "${GOLANG_VER}" 1.26; then
   SPEC=""
 else
-  SPEC="Every Go binary this repository ships to the OCP payload must be built with the golang-native FIPS module (golang 1.26+, GOFIPS140 v1.26.0) rather than linking OpenSSL. Determine where the payload toolchain is actually declared before editing: .ci-operator.yaml's build_root_image is the usual control point, but Konflux/Tekton pipelines, shared builder images, or a generated Dockerfile from another repository can override it. Do not edit Dockerfiles marked DO NOT EDIT; change the template that generates them."
+  SPEC="Every Go binary this repository ships to the OCP payload must be built with the golang-native FIPS module (golang 1.26+ on an openshift-5.1+ build group, or golang 1.27+, with GOFIPS140=v1.26.0) rather than linking OpenSSL. Determine where the payload toolchain is actually declared before editing. .ci-operator.yaml's build_root_image is the usual control point, but the decision is really made by the ART build pipeline from the Doozer group and the builder image in ocp-build-data, and a Konflux build sets it in Dockerfile.konflux instead. Also check whether ocp-build-data carries a GOFIPS140=off or GO_COMPLIANCE_BUILTIN_FIPS_EXCLUDE override for this component: if it does, the exemption is deliberate and needs a justification rather than a code change. Do not edit Dockerfiles marked DO NOT EDIT; change the template that generates them."
 fi
 
 # ── 3. verdict ───────────────────────────────────────────────────────────────
@@ -273,26 +294,28 @@ if [ -z "${GOLANG_VER}" ]; then
     "Confirm the build root provides golang 1.26+ with the native FIPS module."
 else
   if ver_ge "${GOLANG_VER}" 1.26; then
-    if [ -n "${OCP_VER}" ] && ! ver_ge "${OCP_VER}" 5.1; then
+    # golang 1.27+ qualifies on its own; only 1.26 needs an openshift-5.1+
+    # build group to be switched on (golang_builder_FIPS_wrapper.sh).
+    if ! ver_ge "${GOLANG_VER}" 1.27 && [ -n "${OCP_VER}" ] && ! ver_ge "${OCP_VER}" 5.1; then
       add_hit ".ci-operator.yaml" "${BR_LINE}" "${BR_TAG}" \
         "Build root provides golang ${GOLANG_VER} (native FIPS capable) but targets OCP ${OCP_VER}, not 5.1." \
         "Confirm this repository ships in the OCP 5.1 payload; if it does, move the build root to the golang-1.26 openshift-5.1 release image."
       HITS_JSON=$(printf '%s' "${HITS_JSON}" | jq 'sort_by(.file, .line, .match)')
       emit true low \
-        "Go toolchain is already golang ${GOLANG_VER} (native FIPS), but the build root targets OCP ${OCP_VER} rather than 5.1." \
+        "Build root provides golang ${GOLANG_VER} but targets OCP ${OCP_VER}: the ART build pipeline only switches on the built-in FIPS module from golang 1.26 on an openshift-5.1+ group (or golang 1.27+), so this group's builds still use the OpenSSL backend." \
         "${HITS_JSON}" \
         "This repository already builds with the golang-native FIPS module. Confirm whether it produces any artifact consumed by the OCP 5.1 payload; if so, that build must use a golang-1.26 openshift-5.1 build root. Do not downgrade the toolchain while making that change."
       exit 0
     fi
-    pass "Build root provides golang ${GOLANG_VER} and targets OCP ${OCP_VER:-unknown}, so Go binaries use the native FIPS module. No legacy FIPS settings were found in the build files."
+    pass "Build root provides golang ${GOLANG_VER} and targets OCP ${OCP_VER:-unknown}, so production payload builds get the built-in FIPS module from the ART build pipeline. No legacy FIPS settings were found in the build files. Confirm this covers every Go binary the repository ships in the 5.1 payload."
   fi
   add_hit ".ci-operator.yaml" "${BR_LINE}" "${BR_TAG}" \
-    "Build root provides golang ${GOLANG_VER}, which predates the golang-native FIPS module first shipped in golang 1.24 and required at v1.26.0." \
+    "Build root provides golang ${GOLANG_VER}, which predates the golang-native FIPS module (first shipped in golang 1.24, required at v1.26.0 on an openshift-5.1+ build group)." \
     "Move the build root to rhel-9-release-golang-1.26-openshift-5.1."
 fi
 
 HITS_JSON=$(printf '%s' "${HITS_JSON}" | jq 'sort_by(.file, .line, .match)')
 emit true medium \
-  "Build root still provides golang ${GOLANG_VER:-an unparseable version}, so the payload binary links OpenSSL for FIPS instead of using the native module." \
+  "Build root provides golang ${GOLANG_VER:-an unparseable version}, which does not qualify for the built-in FIPS module (golang 1.26 needs an openshift-5.1+ build group, golang 1.27+ always qualifies), so the payload binary links OpenSSL." \
   "${HITS_JSON}" "${SPEC}"
 exit 0
