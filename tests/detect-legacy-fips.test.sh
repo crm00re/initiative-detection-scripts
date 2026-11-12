@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Fixture tests for detect-legacy-fips.sh.
+# Fixture tests for detect-legacy-fips.sh (OCPSTRAT-3842).
 #
 # Run from anywhere:  bash tests/detect-legacy-fips.test.sh
 # Requires bash + jq (both present in the SCI worker image).
@@ -26,7 +26,154 @@ check() {
 
 run() { bash "${SCRIPT}" "$1"; }
 
-# ── fixture: repo using every legacy indicator ────────────────────────────────
+# Every fixture needs Go source: the initiative covers golang binaries and a
+# repo without any .go file is deliberately out of scope.
+mk_go() { printf 'package main\n\nfunc main() {}\n' > "$1/main.go"; }
+
+# The build root is what actually selects the toolchain. `.ci-operator.yaml`
+# is the source of truth for an OCP-built repo, so most fixtures are one file.
+mk_buildroot() { # mk_buildroot <dir> <tag>
+  cat > "$1/.ci-operator.yaml" <<EOF
+build_root_image:
+  name: release
+  namespace: openshift
+  tag: $2
+EOF
+}
+
+# ── migrated: golang 1.26 build root targeting 5.1 ───────────────────────────
+migrated="${WORK}/migrated"
+mkdir -p "${migrated}"
+mk_go "${migrated}"
+mk_buildroot "${migrated}" rhel-9-release-golang-1.26-openshift-5.1
+out="$(run "${migrated}")"
+check "5.1 build root is not affected" "false" "$(jq -r '.affected' <<<"${out}")"
+check "5.1 build root has severity info" "info" "$(jq -r '.severity' <<<"${out}")"
+check "5.1 build root has no hits" "0" "$(jq -r '.hits | length' <<<"${out}")"
+check "5.1 build root needs no implementation_spec" "" "$(jq -r '.implementation_spec' <<<"${out}")"
+
+# ── native toolchain but still targeting an older payload ────────────────────
+t50="${WORK}/ocp50"
+mkdir -p "${t50}"
+mk_go "${t50}"
+mk_buildroot "${t50}" rhel-9-release-golang-1.26-openshift-5.0
+out="$(run "${t50}")"
+check "golang 1.26 on a 5.0 build root is affected" "true" "$(jq -r '.affected' <<<"${out}")"
+check "golang 1.26 on a 5.0 build root is severity low" "low" "$(jq -r '.severity' <<<"${out}")"
+check "5.0 build root hit points at the tag line" ".ci-operator.yaml:4" \
+  "$(jq -r '.hits[0] | "\(.file):\(.line)"' <<<"${out}")"
+
+# ── the primary case: build root predates the native module ──────────────────
+old="${WORK}/legacy-buildroot"
+mkdir -p "${old}"
+mk_go "${old}"
+mk_buildroot "${old}" rhel-9-release-golang-1.23-openshift-4.22
+out="$(run "${old}")"
+check "golang 1.23 build root is affected" "true" "$(jq -r '.affected' <<<"${out}")"
+check "golang 1.23 build root is severity medium" "medium" "$(jq -r '.severity' <<<"${out}")"
+check "the offending tag is quoted back in the hit" \
+  "rhel-9-release-golang-1.23-openshift-4.22" "$(jq -r '.hits[0].match' <<<"${out}")"
+check "affected result carries an implementation_spec" "true" \
+  "$(jq -r '.implementation_spec | length > 0' <<<"${out}")"
+
+# golang 1.26 is the requirement, not 1.2x: 1.9 must not sort as "newer".
+nine="${WORK}/golang19"
+mkdir -p "${nine}"
+mk_go "${nine}"
+mk_buildroot "${nine}" rhel-9-release-golang-1.9-openshift-4.14
+check "golang 1.9 is compared numerically, not lexicographically" "true" \
+  "$(jq -r '.affected' <<<"$(run "${nine}")")"
+
+# ── legacy build_root.image_stream_tag form ─────────────────────────────────
+legacy_style="${WORK}/image-stream-tag"
+mkdir -p "${legacy_style}"
+mk_go "${legacy_style}"
+cat > "${legacy_style}/.ci-operator.yaml" <<'EOF'
+build_root:
+  image_stream_tag:
+    cluster: https://api.ci.openshift.org
+    namespace: ocp
+    name: release
+    tag: golang-1.15
+EOF
+out="$(run "${legacy_style}")"
+check "legacy image_stream_tag build root is affected" "true" "$(jq -r '.affected' <<<"${out}")"
+check "legacy image_stream_tag hit points at its tag line" ".ci-operator.yaml:6" \
+  "$(jq -r '.hits[0] | "\(.file):\(.line)"' <<<"${out}")"
+
+# ── unparseable build root must not be silently treated as migrated ────────
+opaque="${WORK}/opaque-tag"
+mkdir -p "${opaque}"
+mk_go "${opaque}"
+mk_buildroot "${opaque}" latest
+out="$(run "${opaque}")"
+check "unparseable build root tag is flagged" "true" "$(jq -r '.affected' <<<"${out}")"
+
+# ── no build root: state the limitation instead of guessing ─────────────────
+nobr="${WORK}/no-buildroot"
+mkdir -p "${nobr}"
+mk_go "${nobr}"
+out="$(run "${nobr}")"
+check "missing build root is not affected" "false" "$(jq -r '.affected' <<<"${out}")"
+check "missing build root says manual review is needed" "true" \
+  "$(jq -r '.summary | test("manual review"; "i")' <<<"${out}")"
+
+# A Konflux-built repo has no ci-operator build root at all; the pipeline owns
+# the toolchain, so the verdict must say so rather than claim compliance.
+konflux="${WORK}/konflux"
+mkdir -p "${konflux}/.tekton"
+mk_go "${konflux}"
+printf 'apiVersion: tekton.dev/v1\n' > "${konflux}/.tekton/build.yaml"
+check "Konflux repo is routed to manual review" "true" \
+  "$(jq -r '.summary | test("Konflux"; "i")' <<<"$(run "${konflux}")")"
+
+# ── out of scope: no Go source at all ──────────────────────────────────────
+c_repo="${WORK}/non-go"
+mkdir -p "${c_repo}"
+mk_buildroot "${c_repo}" rhel-9-release-golang-1.20-openshift-4.14
+printf '#include <stdio.h>\n' > "${c_repo}/main.c"
+out="$(run "${c_repo}")"
+check "repo with no Go source is not affected" "false" "$(jq -r '.affected' <<<"${out}")"
+check "repo with no Go source explains it is out of scope" "true" \
+  "$(jq -r '.summary | test("No Go source")' <<<"${out}")"
+
+# ── explicit overrides ─────────────────────────────────────────────────────
+# GOFIPS140 in the build files selects the native module even on an old root.
+pinned="${WORK}/explicit-native"
+mkdir -p "${pinned}"
+mk_go "${pinned}"
+mk_buildroot "${pinned}" rhel-9-release-golang-1.23-openshift-4.22
+cat > "${pinned}/Dockerfile" <<'EOF'
+FROM registry.access.redhat.com/ubi9/go-toolset:1.23 AS builder
+ENV GOFIPS140=v1.26.0
+RUN CGO_ENABLED=0 go build -o /app ./cmd/app
+EOF
+out="$(run "${pinned}")"
+check "explicit GOFIPS140=v1.26.0 overrides an old build root" "false" "$(jq -r '.affected' <<<"${out}")"
+check "explicit GOFIPS140 result names the pin" "true" \
+  "$(jq -r '.summary | test("1.26.0")' <<<"${out}")"
+
+# ... but only when the pin actually reaches the required version.
+too_old="${WORK}/explicit-native-too-old"
+mkdir -p "${too_old}"
+mk_go "${too_old}"
+mk_buildroot "${too_old}" rhel-9-release-golang-1.23-openshift-4.22
+printf 'FROM ubi9/go-toolset:1.23\nENV GOFIPS140=v1.24.0\n' > "${too_old}/Dockerfile"
+check "GOFIPS140 below v1.26.0 does not count as migrated" "true" \
+  "$(jq -r '.affected' <<<"$(run "${too_old}")")"
+
+# An explicit legacy setting beats a migrated build root: boringcrypto links
+# OpenSSL no matter which toolchain the build root provides.
+override="${WORK}/override-on-migrated"
+mkdir -p "${override}"
+mk_go "${override}"
+mk_buildroot "${override}" rhel-9-release-golang-1.26-openshift-5.1
+printf 'FROM ubi9/go-toolset:1.26\nENV GOEXPERIMENT=boringcrypto\n' > "${override}/Dockerfile"
+out="$(run "${override}")"
+check "explicit boringcrypto beats a migrated build root" "true" "$(jq -r '.affected' <<<"${out}")"
+check "explicit legacy override is severity medium" "medium" "$(jq -r '.severity' <<<"${out}")"
+
+# ── every legacy indicator, on a repo with no build root ───────────────────
 legacy="${WORK}/legacy"
 mkdir -p "${legacy}/cmd/app"
 cat > "${legacy}/Dockerfile" <<'EOF'
@@ -49,7 +196,6 @@ import (
 
 func main() {}
 EOF
-
 out="$(run "${legacy}")"
 check "legacy repo is affected" "true" "$(jq -r '.affected' <<<"${out}")"
 check "legacy repo reports 5 hits" "5" "$(jq -r '.hits | length' <<<"${out}")"
@@ -65,11 +211,11 @@ check "hit line numbers are integers" "true" \
 check "affected result carries an implementation_spec" "true" \
   "$(jq -r '.implementation_spec | length > 0' <<<"${out}")"
 
-# ── determinism: the dry-run can be repeated and diffed ──────────────────────
+# ── determinism: the dry-run can be repeated and diffed ────────────────────
 check "two runs of the same tree are byte-identical" "same" \
   "$([ "$(run "${legacy}")" = "$(run "${legacy}")" ] && echo same || echo different)"
 
-# ── line numbers sort numerically, not lexicographically ─────────────────────
+# ── line numbers sort numerically, not lexicographically ───────────────────
 ordering="${WORK}/ordering"
 mkdir -p "${ordering}"
 { for n in $(seq 1 12); do
@@ -79,13 +225,14 @@ mkdir -p "${ordering}"
       echo "# filler ${n}"
     fi
   done; } > "${ordering}/Dockerfile"
+printf 'package main\n\nfunc main() {}\n' > "${ordering}/main.go"
 out="$(run "${ordering}")"
 check "line 2 sorts before line 10" "10" \
   "$(jq -r '.hits | map(.line) | last' <<<"${out}")"
 check "line numbers stay numeric in JSON" "true" \
   "$(jq -r '[.hits[].line] | all(type == "number")' <<<"${out}")"
 
-# ── regression: documentation mentioning GOFIPS140 is not a migration ────────
+# ── regression: documentation mentioning GOFIPS140 is not a migration ──────
 docs="${WORK}/docs-mention"
 cp -r "${legacy}" "${docs}"
 mkdir -p "${docs}/docs"
@@ -96,58 +243,96 @@ EOF
 out="$(run "${docs}")"
 check "doc mention of GOFIPS140 does not suppress hits" "true" \
   "$(jq -r '.affected' <<<"${out}")"
+check "doc mention does not change the hit count" "5" \
+  "$(jq -r '.hits | length' <<<"${out}")"
 
-# ── already migrated: GOFIPS140 in build config ──────────────────────────────
-migrated="${WORK}/migrated"
-mkdir -p "${migrated}"
-cat > "${migrated}/Dockerfile" <<'EOF'
-FROM registry.access.redhat.com/ubi9/go-toolset:1.26 AS builder
-ENV GOFIPS140=v1.26.0
-RUN CGO_ENABLED=0 go build -tags no_openssl -o /app ./cmd/app
+# ── .git is not traversed ──────────────────────────────────────────────────
+# ── vendor/ is not scanned ───────────────────────────────────────────────────
+# Regression from real repos: golangci-lint's vendored gci formatter ships a
+# list of standard packages containing `"crypto/tls/fipsonly": {}`, which
+# matched as an import and flagged machine-api-operator and
+# aws-load-balancer-operator as affected. Vendored code is not built into the
+# repository's own binaries.
+vendored="${WORK}/vendored"
+mkdir -p "${vendored}/vendor/github.com/golangci/golangci-lint/pkg/gci"
+mk_go "${vendored}"
+mk_buildroot "${vendored}" rhel-9-release-golang-1.26-openshift-5.1
+cat > "${vendored}/vendor/github.com/golangci/golangci-lint/pkg/gci/standard_list.go" <<'EOF'
+package gci
+
+var standardPackages = map[string]struct{}{
+	"crypto/tls/fipsonly": {},
+}
 EOF
-out="$(run "${migrated}")"
-check "migrated repo is not affected" "false" "$(jq -r '.affected' <<<"${out}")"
-check "migrated result has severity info" "info" "$(jq -r '.severity' <<<"${out}")"
-check "migrated result has empty hits" "0" "$(jq -r '.hits | length' <<<"${out}")"
-
-# ── clean repo: no FIPS settings at all ──────────────────────────────────────
-clean="${WORK}/clean"
-mkdir -p "${clean}"
-printf 'FROM scratch\n' > "${clean}/Dockerfile"
-printf 'module example.com/clean\n\ngo 1.26\n' > "${clean}/go.mod"
-out="$(run "${clean}")"
-check "clean repo is not affected" "false" "$(jq -r '.affected' <<<"${out}")"
-check "clean result is contract-complete" "true" \
-  "$(jq -r 'has("severity") and has("hits") and has("implementation_spec")' <<<"${out}")"
+out="$(run "${vendored}")"
+check "vendored mention of the fipsonly package is not a hit" "false" "$(jq -r '.affected' <<<"${out}")"
+check "vendored fixture reports no hits" "0" "$(jq -r '.hits | length' <<<"${out}")"
 
 # ── .git is not traversed ────────────────────────────────────────────────────
 withgit="${WORK}/with-git"
 mkdir -p "${withgit}"
-printf 'FROM scratch\n' > "${withgit}/Dockerfile"
+mk_go "${withgit}"
+mk_buildroot "${withgit}" rhel-9-release-golang-1.26-openshift-5.1
 git -C "${withgit}" init -q .
 printf 'ENV GOLANG_FIPS=1\n' > "${withgit}/.git/Dockerfile"
-out="$(run "${withgit}")"
-check ".git contents are not scanned" "false" "$(jq -r '.affected' <<<"${out}")"
+check ".git contents are not scanned" "false" "$(jq -r '.affected' <<<"$(run "${withgit}")")"
 
-# ── Containerfile-only repo: include globs must cover it ─────────────────────
+# ── Containerfile-only repo: include globs must cover it ───────────────────
 containerfile="${WORK}/containerfile"
 mkdir -p "${containerfile}"
+mk_go "${containerfile}"
 cat > "${containerfile}/Containerfile" <<'EOF'
 FROM registry.access.redhat.com/ubi9/go-toolset:1.23
 ENV GOLANG_FIPS=1
 EOF
-out="$(run "${containerfile}")"
-check "Containerfile GOLANG_FIPS=1 is detected" "true" "$(jq -r '.affected' <<<"${out}")"
+check "Containerfile GOLANG_FIPS=1 is detected" "true" \
+  "$(jq -r '.affected' <<<"$(run "${containerfile}")")"
 
-# ── no_openssl alone is not a hit ────────────────────────────────────────────
+# ── the -tags forms that actually work in practice ─────────────────────────
+# `-tags openssl`, `-tags=openssl` and `-tags="openssl"` are all valid; an
+# earlier version only matched the first, so a repo using the equals form was
+# reported clean.
+for form in '-tags openssl' '-tags=openssl' '-tags="openssl"' '-tags "openssl"'; do
+  tdir="${WORK}/tags-$(printf '%s' "${form}" | tr -c 'a-zA-Z0-9' '_')"
+  mkdir -p "${tdir}"
+  mk_go "${tdir}"
+  printf 'FROM x\nRUN go build %s -o /a ./cmd\n' "${form}" > "${tdir}/Dockerfile"
+  check "openssl build tag detected in form: ${form}" "true" \
+    "$(jq -r '.affected' <<<"$(run "${tdir}")")"
+done
+
+# ── golang 1.27+ qualifies regardless of the build group ────────────────────
+# golang_builder_FIPS_wrapper.sh defaults GO_COMPLIANCE_BUILTIN_FIPS_INCLUDE to
+# '.*' from 1.27 on; only 1.26 needs an openshift-5.1+ group.
+g127="${WORK}/golang127-old-group"
+mkdir -p "${g127}"
+mk_go "${g127}"
+mk_buildroot "${g127}" rhel-9-release-golang-1.27-openshift-5.0
+check "golang 1.27 on a 5.0 build root is not affected" "false" \
+  "$(jq -r '.affected' <<<"$(run "${g127}")")"
+
+# ── no_openssl alone is not a hit ──────────────────────────────────────────
 noopenssl="${WORK}/no-openssl"
 mkdir -p "${noopenssl}"
+mk_go "${noopenssl}"
+mk_buildroot "${noopenssl}" rhel-9-release-golang-1.26-openshift-5.1
 cat > "${noopenssl}/Makefile" <<'EOF'
 build:
 	go build -tags no_openssl -o bin/app ./cmd/app
 EOF
-out="$(run "${noopenssl}")"
-check "no_openssl tag alone is not affected" "false" "$(jq -r '.affected' <<<"${out}")"
+check "no_openssl tag alone is not affected" "false" \
+  "$(jq -r '.affected' <<<"$(run "${noopenssl}")")"
+
+# ── contract completeness on every path ────────────────────────────────────
+for fixture in "${migrated}" "${old}" "${nobr}" "${legacy}"; do
+  out="$(run "${fixture}")"
+  check "contract complete: $(basename "${fixture}")" "true" \
+    "$(jq -r '(.affected|type=="boolean") and (.summary|type=="string") and
+              (.severity|type=="string") and (.hits|type=="array") and
+              (.implementation_spec|type=="string")' <<<"${out}")"
+  check "no duplicate hits: $(basename "${fixture}")" "true" \
+    "$(jq -r '[.hits[] | "\(.file):\(.line):\(.match)"] | (length == (unique | length))' <<<"${out}")"
+done
 
 printf '\n%d passed, %d failed\n' "${pass}" "${fail}"
 [ "${fail}" -eq 0 ]
