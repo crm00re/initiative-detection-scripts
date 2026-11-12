@@ -86,6 +86,15 @@ if [ -z "${IMAGE_REF}" ]; then
   pass "No image reference was supplied, so nothing could be inspected. Verify the scan manifest for this item."
 fi
 
+# The manifest stores "<component>|<pull spec>", and while the batch image scan
+# splits the two, the test-script path passes the raw pair through. Only the
+# right-hand side is a valid reference, and a pull spec never contains "|", so
+# tolerate both shapes rather than reporting an unpullable image - which reads as
+# "not affected" and hides everything.
+case "${IMAGE_REF}" in
+  *"|"*) IMAGE_REF="${IMAGE_REF##*|}" ;;
+esac
+
 if ! command -v skopeo >/dev/null 2>&1; then
   pass "skopeo is not available in this worker, so ${IMAGE_REF} could not be inspected. This is an environment fault, not a finding about the image."
 fi
