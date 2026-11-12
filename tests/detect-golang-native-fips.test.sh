@@ -115,6 +115,18 @@ check "image without Go binaries says why" "true" \
   "$(jq -r '.summary | test("no Go binaries")' <<<"${out}")"
 check "no-Go verdict carries no hits" "0" "$(jq -r '.hits | length' <<<"${out}")"
 
+# ── the "component|pull spec" form must be accepted ───────────────────────
+# The scan manifest stores "<component>|<pull spec>". The batch image scan
+# splits the two, but the test-script path passes the pair through unchanged,
+# so a script that assumes a bare reference reports "could not pull" for every
+# image - which the UI shows as Not Affected.
+out="$(run "component-name|oci:${WORK}/oci-plain:latest")"
+check "component|pull-spec form is accepted" "true" "$(jq -r '.affected' <<<"${out}")"
+check "the stripped reference is quoted in the summary" "true" \
+  "$(jq -r '.summary | startswith("1 of 1")' <<<"${out}")"
+check "the component prefix does not leak into the hit file" "true" \
+  "$(jq -r '.hits[0].file | startswith("component-name|") | not' <<<"${out}")"
+
 # ── determinism: a dry run can be repeated and diffed ──────────────────────
 check "two runs of the same image are byte-identical" "same" \
   "$([ "$(run "oci:${WORK}/oci-plain:latest")" = "$(run "oci:${WORK}/oci-plain:latest")" ] && echo same || echo different)"
