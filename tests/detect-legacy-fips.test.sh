@@ -101,13 +101,72 @@ check "legacy image_stream_tag build root is affected" "true" "$(jq -r '.affecte
 check "legacy image_stream_tag hit points at its tag line" ".ci-operator.yaml:6" \
   "$(jq -r '.hits[0] | "\(.file):\(.line)"' <<<"${out}")"
 
-# ── unparseable build root must not be silently treated as migrated ────────
-opaque="${WORK}/opaque-tag"
+# ── a build root with no golang version in it ───────────────────────────────
+# openshift/boilerplate:latest is the shared builder for the OSD/srep operators.
+# Its toolchain is decided by that image, not by the consuming repository, so the
+# repo cannot be judged from a clone. That is the same conclusion as having no
+# build root, and it must be reported the same way instead of asserting that the
+# binary "links OpenSSL" - which the script cannot know.
+boilerplate="${WORK}/boilerplate-latest"
+mkdir -p "${boilerplate}"
+mk_go "${boilerplate}"
+cat > "${boilerplate}/.ci-operator.yaml" <<'EOF'
+build_root_image:
+  name: boilerplate
+  namespace: openshift
+  tag: latest
+EOF
+out="$(run "${boilerplate}")"
+check "boilerplate:latest is not reported as affected" "false" "$(jq -r '.affected' <<<"${out}")"
+check "boilerplate:latest is not claimed to link OpenSSL" "false" \
+  "$(jq -r '.summary | test("OpenSSL")' <<<"${out}")"
+check "the inherited build root is named in full" "true" \
+  "$(jq -r '.summary | test("openshift/boilerplate:latest")' <<<"${out}")"
+check "boilerplate:latest is routed to manual review" "true" \
+  "$(jq -r '.summary | test("manual review"; "i")' <<<"${out}")"
+
+# A floating tag with no name/namespace: still unresolved, and the summary must
+# still name the tag rather than an anonymous "unparseable version".
+opaque="${WORK}/floating-tag"
 mkdir -p "${opaque}"
 mk_go "${opaque}"
 mk_buildroot "${opaque}" latest
 out="$(run "${opaque}")"
-check "unparseable build root tag is flagged" "true" "$(jq -r '.affected' <<<"${out}")"
+check "a floating tag is not reported as affected" "false" "$(jq -r '.affected' <<<"${out}")"
+check "a floating tag is named in the summary" "true" \
+  "$(jq -r '.summary | test("latest")' <<<"${out}")"
+
+# Flow-style build_root_image must yield the same identity as the block form.
+flow="${WORK}/flow-style"
+mkdir -p "${flow}"
+mk_go "${flow}"
+cat > "${flow}/.ci-operator.yaml" <<'EOF'
+build_root_image: {name: boilerplate, namespace: openshift, tag: latest}
+EOF
+out="$(run "${flow}")"
+check "flow-style build root is parsed" "true" \
+  "$(jq -r '.summary | test("openshift/boilerplate:latest")' <<<"${out}")"
+
+# Flow-style with a golang tag must still reach the real verdict.
+flowgo="${WORK}/flow-style-golang"
+mkdir -p "${flowgo}"
+mk_go "${flowgo}"
+cat > "${flowgo}/.ci-operator.yaml" <<'EOF'
+build_root_image: {name: release, namespace: openshift, tag: rhel-9-release-golang-1.23-openshift-4.22}
+EOF
+check "flow-style golang build root is judged on its tag" "true" \
+  "$(jq -r '.affected' <<<"$(run "${flowgo}")")"
+
+# No Go source wins over an unparseable build root: the initiative covers golang
+# binaries, so the tag is never consulted.
+nogo="${WORK}/non-go-floating"
+mkdir -p "${nogo}"
+printf '#include <stdio.h>\n' > "${nogo}/main.c"
+mk_buildroot "${nogo}" latest
+out="$(run "${nogo}")"
+check "non-Go repo with a floating build root is out of scope" "false" "$(jq -r '.affected' <<<"${out}")"
+check "non-Go repo reports no Go source" "true" \
+  "$(jq -r '.summary | test("No Go source")' <<<"${out}")"
 
 # ── no build root: state the limitation instead of guessing ─────────────────
 nobr="${WORK}/no-buildroot"

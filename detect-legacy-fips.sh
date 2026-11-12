@@ -33,6 +33,14 @@
 #
 #   The build root image does NOT set GOFIPS140 itself; the shim does.
 #
+#   Not every build root names a golang version. `openshift/boilerplate:latest`
+#   is the shared builder for the OSD/srep operators and decides their toolchain
+#   by itself; some payload components use `node22`, and some declare nothing.
+#   Those repositories cannot be judged from a clone, so they are reported as
+#   needing manual review - the build root is named so the reader knows where to
+#   look - rather than being guessed at. Claiming they "link OpenSSL" would be
+#   asserting a conclusion this script has no evidence for.
+#
 # SECONDARY SIGNAL: explicit build settings that override the toolchain
 #   GOEXPERIMENT=boringcrypto, GOFIPS=1, GOLANG_FIPS=1, `-tags openssl`,
 #   `import "crypto/tls/fipsonly"` force the OpenSSL path even on a newer
@@ -127,31 +135,56 @@ ver_ge() {
   [ "${amin}" -ge "${bmin}" ]
 }
 
-# Prints "<line>\t<tag>" for the build root declared in .ci-operator.yaml.
-# Handles the current block form, a flow-style one-liner, and the legacy
-# build_root.image_stream_tag form. Prints nothing when undeclared.
+# Prints "<line>|<name>|<namespace>|<tag>" for the build root declared in
+# .ci-operator.yaml, or nothing when it is undeclared. The name and namespace
+# matter as much as the tag: `tag: latest` says nothing on its own, while
+# "openshift/boilerplate:latest" tells the reader which image actually decides
+# the toolchain. Handles the current block form, a flow-style one-liner, and the
+# legacy build_root.image_stream_tag form.
 ci_operator_build_root() {
   local f=".ci-operator.yaml"
   [ -f "${f}" ] || return 0
 
   awk '
     function trim(s) { gsub(/^[ \t]+/, "", s); gsub(/[ \t]+$/, "", s); return s }
-    function emit(v) { printf "%d\t%s\n", line, trim(v); found = 1; exit }
+    function emit() {
+      if (line == 0) return
+      # "|" rather than a tab: tabs are IFS whitespace and runs of them collapse,
+      # which would shift the fields whenever name or namespace is absent.
+      printf "%d|%s|%s|%s\n", line, trim(name), trim(ns), trim(tag)
+      found = 1
+    }
 
-    # current style, flow form: build_root_image: {name: ..., tag: ...}
+    # current style, flow form:
+    #   build_root_image: {name: ..., namespace: ..., tag: ...}
     /^[ \t]*build_root_image:[ \t]*\{/ {
-      line = NR; v = $0
-      if (match(v, /tag:[ \t]*[^,}]+/)) emit(substr(v, RSTART + 4))
-      next
+      line = NR
+      # Drop the "build_root_image:" prefix first, otherwise the first comma
+      # field is "build_root_image: name: X" and matches neither name nor tag.
+      sub(/^[ \t]*build_root_image:[ \t]*/, "", $0)
+      gsub(/[{}]/, "", $0)
+      n = split($0, parts, ",")
+      for (i = 1; i <= n; i++) {
+        kv = parts[i]
+        if (kv ~ /^[ \t]*name:/)      name = substr(kv, index(kv, ":") + 1)
+        if (kv ~ /^[ \t]*namespace:/) ns   = substr(kv, index(kv, ":") + 1)
+        if (kv ~ /^[ \t]*tag:/)       tag  = substr(kv, index(kv, ":") + 1)
+      }
+      emit(); exit
     }
     # current style, block form
     /^[ \t]*build_root_image:[ \t]*$/ { inbr = 1; next }
-    inbr && /^[ \t]*tag:/ { line = NR; v = $0; sub(/^[ \t]*tag:[ \t]*/, "", v); emit(v) }
+    inbr && /^[ \t]*name:/      { name = substr($0, index($0, ":") + 1); next }
+    inbr && /^[ \t]*namespace:/ { ns   = substr($0, index($0, ":") + 1); next }
+    inbr && /^[ \t]*tag:/       { tag  = substr($0, index($0, ":") + 1); line = NR; next }
     inbr && /^[^ \t#]/ { inbr = 0 }
-    # legacy style: build_root.image_stream_tag.tag
+    # legacy style: build_root.image_stream_tag.{name,namespace,tag}
     /^[ \t]*image_stream_tag:[ \t]*$/ { inist = 1; next }
-    inist && /^[ \t]*tag:/ { line = NR; v = $0; sub(/^[ \t]*tag:[ \t]*/, "", v); emit(v) }
+    inist && /^[ \t]*name:/      { name = substr($0, index($0, ":") + 1); next }
+    inist && /^[ \t]*namespace:/ { ns   = substr($0, index($0, ":") + 1); next }
+    inist && /^[ \t]*tag:/       { tag  = substr($0, index($0, ":") + 1); line = NR; next }
     inist && /^[^ \t#]/ { inist = 0 }
+    END { if (line > 0) emit() }
   ' "${f}" | tr -d "\"'"
 }
 
@@ -245,10 +278,20 @@ fi
 # ── 2. primary proxy signal: the ci-operator build root ──────────────────────
 BR_LINE=""
 BR_TAG=""
+BR_NAME=""
+BR_NS=""
 BR_RAW="$(ci_operator_build_root)"
 if [ -n "${BR_RAW}" ]; then
-  BR_LINE="${BR_RAW%%$'\t'*}"
-  BR_TAG="${BR_RAW#*$'\t'}"
+  IFS='|' read -r BR_LINE BR_NAME BR_NS BR_TAG <<< "${BR_RAW}"
+fi
+
+# Human-readable identity of the build root, e.g. openshift/boilerplate:latest.
+# A tag on its own ("latest") says nothing about the toolchain.
+BR_ID="${BR_TAG:-<undeclared>}"
+if [ -n "${BR_NAME}" ] && [ -n "${BR_NS}" ]; then
+  BR_ID="${BR_NS}/${BR_NAME}:${BR_TAG:-<no tag>}"
+elif [ -n "${BR_NAME}" ]; then
+  BR_ID="${BR_NAME}:${BR_TAG:-<no tag>}"
 fi
 GOLANG_VER=""
 OCP_VER=""
@@ -289,9 +332,12 @@ if [ -z "${BR_TAG}" ]; then
 fi
 
 if [ -z "${GOLANG_VER}" ]; then
-  add_hit ".ci-operator.yaml" "${BR_LINE}" "${BR_TAG}" \
-    "Could not parse a golang version out of the build root tag, so its FIPS mode cannot be determined." \
-    "Confirm the build root provides golang 1.26+ with the native FIPS module."
+  # The build root does not name a golang version: a floating tag
+  # (openshift/boilerplate:latest) or an image for another runtime entirely.
+  # The toolchain is then decided by that image, not by this repository, so the
+  # repo cannot be judged from a clone - same conclusion as having no build
+  # root at all, and reported the same way rather than guessed at.
+  pass "Build root ${BR_ID} does not name a golang version, so this repository's FIPS mode cannot be determined from a clone. If the toolchain comes from ${BR_ID}, or from a build config owned by another repository, check there. Needs manual review rather than an automatic verdict."
 else
   if ver_ge "${GOLANG_VER}" 1.26; then
     # golang 1.27+ qualifies on its own; only 1.26 needs an openshift-5.1+
@@ -316,6 +362,6 @@ fi
 
 HITS_JSON=$(printf '%s' "${HITS_JSON}" | jq 'sort_by(.file, .line, .match)')
 emit true medium \
-  "Build root provides golang ${GOLANG_VER:-an unparseable version}, which does not qualify for the built-in FIPS module (golang 1.26 needs an openshift-5.1+ build group, golang 1.27+ always qualifies), so the payload binary links OpenSSL." \
+  "Build root provides golang ${GOLANG_VER}, which predates the built-in FIPS module (golang 1.26 on an openshift-5.1+ build group, or golang 1.27+), so the payload binary links OpenSSL." \
   "${HITS_JSON}" "${SPEC}"
 exit 0
