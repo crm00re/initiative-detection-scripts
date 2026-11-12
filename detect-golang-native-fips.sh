@@ -95,6 +95,16 @@ case "${IMAGE_REF}" in
   *"|"*) IMAGE_REF="${IMAGE_REF##*|}" ;;
 esac
 
+# The worker's env handoff sources its variables without exporting them, and the
+# test-script path does not re-export REGISTRY_AUTH_FILE the way the batch image
+# scan does, so skopeo can end up unauthenticated even though the credentials are
+# mounted - which fails every pull instantly and reports "not affected" for
+# every image. Fall back to the documented mount point.
+if [ -z "${REGISTRY_AUTH_FILE:-}" ] && [ -r /var/run/secrets/registry/auth.json ]; then
+  export REGISTRY_AUTH_FILE=/var/run/secrets/registry/auth.json
+  debug "REGISTRY_AUTH_FILE was unset; using /var/run/secrets/registry/auth.json"
+fi
+
 if ! command -v skopeo >/dev/null 2>&1; then
   pass "skopeo is not available in this worker, so ${IMAGE_REF} could not be inspected. This is an environment fault, not a finding about the image."
 fi
