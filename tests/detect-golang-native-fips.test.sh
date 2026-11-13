@@ -132,10 +132,22 @@ check "two runs of the same image are byte-identical" "same" \
   "$([ "$(run "oci:${WORK}/oci-plain:latest")" = "$(run "oci:${WORK}/oci-plain:latest")" ] && echo same || echo different)"
 
 # ── uninspectable target: explain, never claim compliance ──────────────────
+# It must also be machine-distinguishable from a real pass. Without the flag a
+# failed scan is stored as affected=false and, in one aggregation path, even the
+# summary is dropped - which is exactly how a failed dry run produced 26 silent
+# "clear" results.
 out="$(run "oci:${WORK}/does-not-exist:latest")"
 check "unpullable image is not affected" "false" "$(jq -r '.affected' <<<"${out}")"
+check "unpullable image is marked inconclusive" "true" "$(jq -r '.inconclusive // false' <<<"${out}")"
 check "unpullable image says it proves nothing about compliance" "true" \
   "$(jq -r '.summary | test("not evidence that the image is compliant")' <<<"${out}")"
+
+# A conclusive pass must NOT be flagged inconclusive, or callers will treat
+# every clean result as a failure.
+out="$(run "oci:${WORK}/oci-native:latest")"
+check "a native image is not marked inconclusive" "false" "$(jq -r '.inconclusive // false' <<<"${out}")"
+out="$(run "oci:${WORK}/oci-nogo:latest")"
+check "an image without Go binaries is not marked inconclusive" "false" "$(jq -r '.inconclusive // false' <<<"${out}")"
 
 # ── contract completeness ──────────────────────────────────────────────────
 for fixture in native plain nogo; do
