@@ -66,6 +66,19 @@ pass() { # pass <summary>
   exit 0
 }
 
+# inconclusive: the target was not inspected at all (unpullable, missing tools,
+# no argument). This is NOT the same as "inspected and clean", and reporting it
+# as a pass is how a failed scan becomes a silent green result: the caller stores
+# affected=false and, in at least one aggregation path, drops the summary - so
+# nothing distinguishes it from a real pass. The flag gives callers something
+# machine-readable to count and surface.
+inconclusive() { # inconclusive <summary>
+  jq -n --arg summary "$1" \
+    '{affected: false, summary: $summary, severity: "info",
+      hits: [], implementation_spec: "", inconclusive: true}'
+  exit 0
+}
+
 # Hits carry the image reference in "file" by convention: the worker rewrites
 # that to the human-readable image name from the scan manifest. Per-binary
 # detail therefore goes in "match" and "description".
@@ -83,7 +96,7 @@ add_hit() { # add_hit <match> <description> <suggestion>
 HITS_JSON="[]"
 
 if [ -z "${IMAGE_REF}" ]; then
-  pass "No image reference was supplied, so nothing could be inspected. Verify the scan manifest for this item."
+  inconclusive "No image reference was supplied, so nothing could be inspected. Verify the scan manifest for this item."
 fi
 
 # The manifest stores "<component>|<pull spec>", and while the batch image scan
@@ -106,10 +119,10 @@ if [ -z "${REGISTRY_AUTH_FILE:-}" ] && [ -r /var/run/secrets/registry/auth.json 
 fi
 
 if ! command -v skopeo >/dev/null 2>&1; then
-  pass "skopeo is not available in this worker, so ${IMAGE_REF} could not be inspected. This is an environment fault, not a finding about the image."
+  inconclusive "skopeo is not available in this worker, so ${IMAGE_REF} could not be inspected. This is an environment fault, not a finding about the image."
 fi
 
-WORKDIR="$(mktemp -d)" || pass "Could not create a working directory to inspect ${IMAGE_REF}."
+WORKDIR="$(mktemp -d)" || inconclusive "Could not create a working directory to inspect ${IMAGE_REF}."
 trap 'rm -rf "${WORKDIR}"' EXIT
 
 # ── 1. pull ─────────────────────────────────────────────────────────────────
@@ -129,7 +142,7 @@ esac
 debug "Pulling ${SRC_REF}..."
 if ! timeout "${IMAGE_TIMEOUT_SECONDS}" skopeo copy --quiet --retry-times 2 \
     "${SRC_REF}" "dir:${IMG_DIR}" >/dev/null 2>"${WORKDIR}/pull.err"; then
-  pass "Could not pull ${IMAGE_REF} (registry unreachable, image removed, or credentials missing), so its FIPS mode was not determined. This is not evidence that the image is compliant."
+  inconclusive "Could not pull ${IMAGE_REF} (registry unreachable, image removed, or credentials missing), so its FIPS mode was not determined. This is not evidence that the image is compliant."
 fi
 
 # ── 2. unpack ───────────────────────────────────────────────────────────────
